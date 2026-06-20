@@ -1127,6 +1127,38 @@ async function handleLateMonthView(request, env) {
       <td style="text-align:center;font-weight:600;color:#991b1b;">+${e.minsLate} min</td>
     </tr>`).join('');
 
+  // CSV export
+  if (url.searchParams.get('export') === 'csv') {
+    const summaryHeader = ['Worker', 'Days Late', 'Total Minutes Late', 'Avg Minutes Late'];
+    const detailHeader  = ['Date', 'Worker', 'First Check-in (SGT)', 'Minutes Late'];
+    const lines = [
+      '-- Summary --',
+      summaryHeader.map(h => `"${csvSafe(h)}"`).join(','),
+      ...summary.map(s => [
+        `"${csvSafe(s.name)}"`,
+        s.count,
+        s.totalMins,
+        Math.round(s.totalMins / s.count)
+      ].join(',')),
+      '',
+      '-- Detail --',
+      detailHeader.map(h => `"${csvSafe(h)}"`).join(','),
+      ...lateEntries.map(e => [
+        `"${csvSafe(dayLabel(e.sgDate))}"`,
+        `"${csvSafe(e.name)}"`,
+        `"${csvSafe(formatSGTime(e.firstCheckin))}"`,
+        e.minsLate
+      ].join(','))
+    ];
+    return new Response(lines.join('\r\n'), {
+      headers: {
+        'Content-Type': 'text/csv',
+        'Content-Disposition': `attachment; filename="late-report-${selectedMonth}.csv"`,
+        'Cache-Control': 'no-store'
+      }
+    });
+  }
+
   const css = ADMIN_CSS + `
     .badge-late { background:#fee2e2; color:#991b1b; padding:.15rem .5rem;
                   border-radius:999px; font-size:.78rem; font-weight:700; border:1px solid #fca5a5; }
@@ -1160,6 +1192,7 @@ async function handleLateMonthView(request, env) {
       </select>
     </form>
     <span style="font-size:.9rem;color:#52525b;">Start time: <strong>${escHtml(startTime)}</strong> SGT</span>
+    <a href="/admin/late/month?month=${escHtml(selectedMonth)}&export=csv" class="btn btn-sm btn-gray">Export to CSV</a>
   </div>
 
   ${summary.length === 0
