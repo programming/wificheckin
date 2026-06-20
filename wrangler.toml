@@ -1,0 +1,8 @@
+name = "atlascheckin"
+pages_build_output_dir = "./dist"
+compatibility_date = "2024-09-23"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "attendance-db"
+database_id = "8addea4a-a877-4980-bd62-482d034148a7"
