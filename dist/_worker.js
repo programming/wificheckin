@@ -340,15 +340,33 @@ function compareFingerprints(baseline, current) {
 }
 
 // ─── Settings (ALLOWED_IPS stored in DB, env var is fallback) ────────────────
+// Module-level cache so repeated requests on the same isolate skip the DB read.
+
+let allowedIPsCache = null;
+let allowedIPsCachedAt = 0;
+const ALLOWED_IPS_TTL_MS = 30_000;
 
 async function getAllowedIPs(env) {
+  const now = Date.now();
+  if (allowedIPsCache !== null && now - allowedIPsCachedAt < ALLOWED_IPS_TTL_MS) {
+    return allowedIPsCache;
+  }
   try {
     const row = await env.DB.prepare(
       "SELECT value FROM settings WHERE key = 'ALLOWED_IPS'"
     ).first();
-    if (row && row.value) return row.value;
+    if (row && row.value) {
+      allowedIPsCache = row.value;
+      allowedIPsCachedAt = now;
+      return allowedIPsCache;
+    }
   } catch { /* fall through */ }
   return env.ALLOWED_IPS || '';
+}
+
+function invalidateAllowedIPsCache() {
+  allowedIPsCache = null;
+  allowedIPsCachedAt = 0;
 }
 
 // ─── Route handlers ───────────────────────────────────────────────────────────
@@ -645,7 +663,13 @@ async function handleAdminLogin(request, env) {
   const formData = await request.formData();
   const key = formData.get('key') || '';
 
-  if (key === env.ADMIN_KEY) {
+  // Constant-time compare to avoid timing attacks on the admin password.
+  const enc = new TextEncoder();
+  const a = enc.encode(key.padEnd(128));
+  const b = enc.encode((env.ADMIN_KEY || '').padEnd(128));
+  let diff = key.length ^ (env.ADMIN_KEY || '').length;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  if (diff === 0) {
     // Success: reset fail count
     await env.DB.prepare(
       'DELETE FROM admin_login_attempts WHERE ip_address = ?'
@@ -656,7 +680,7 @@ async function handleAdminLogin(request, env) {
       status: 302,
       headers: {
         'Location': '/admin',
-        'Set-Cookie': `admin_session=${sessionToken}; HttpOnly; Secure; SameSite=Strict; Path=/admin`
+        'Set-Cookie': `admin_session=${sessionToken}; HttpOnly; Secure; SameSite=Strict; Path=/admin; Max-Age=86400`
       }
     });
   }
@@ -727,8 +751,7 @@ async function handleAdminView(request, env) {
   const workerRows = (workers.results || []).map(w => {
     const checkinUrl = `https://atlascheckin.pages.dev/checkin?token=${encodeURIComponent(w.token)}`;
     const activeLabel = w.active ? 'Active' : '<span style="color:#a1a1aa;">Inactive</span>';
-    const toggleAction = w.active ? 'deactivate' : 'activate';
-    const toggleLabel  = w.active ? 'Deactivate' : 'Activate';
+    const toggleLabel = w.active ? 'Deactivate' : 'Activate';
     const nameClass = w.active ? '' : 'inactive';
     return `<div class="worker-row">
       <span class="worker-name ${nameClass}">${escHtml(w.first_name)} ${escHtml(w.last_name)}</span>
@@ -744,6 +767,12 @@ async function handleAdminView(request, env) {
         <button type="submit" class="btn btn-sm btn-gray"
           onclick="return confirm('Reset fingerprint baseline for ${escHtml(w.first_name)}?')">
           Reset Baseline
+        </button>
+      </form>
+      <form method="POST" action="/admin/worker/${w.id}/delete" style="display:inline">
+        <button type="submit" class="btn btn-sm btn-red"
+          onclick="return confirm('Permanently delete ${escHtml(w.first_name)} ${escHtml(w.last_name)} and all their records? This cannot be undone.')">
+          Delete
         </button>
       </form>
     </div>`;
@@ -881,6 +910,14 @@ async function handleResetFingerprint(workerId, env) {
   return new Response(null, { status: 302, headers: { 'Location': '/admin' } });
 }
 
+async function handleDeleteWorker(workerId, env) {
+  // Delete all related records first (FK constraint order), then the worker row.
+  await env.DB.prepare('DELETE FROM checkins    WHERE worker_id = ?').bind(workerId).run();
+  await env.DB.prepare('DELETE FROM fingerprints WHERE worker_id = ?').bind(workerId).run();
+  await env.DB.prepare('DELETE FROM workers      WHERE id = ?').bind(workerId).run();
+  return new Response(null, { status: 302, headers: { 'Location': '/admin' } });
+}
+
 async function handleUpdateAllowedIPs(request, env) {
   const formData = await request.formData();
   const value = (formData.get('allowed_ips') || '').trim();
@@ -889,6 +926,7 @@ async function handleUpdateAllowedIPs(request, env) {
     VALUES ('ALLOWED_IPS', ?, CURRENT_TIMESTAMP)
     ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = CURRENT_TIMESTAMP
   `).bind(value, value).run();
+  invalidateAllowedIPsCache();
   return new Response(null, { status: 302, headers: { 'Location': '/admin' } });
 }
 
@@ -950,6 +988,9 @@ export default {
 
       const resetMatch = path.match(/^\/admin\/worker\/(\d+)\/reset-fp$/);
       if (resetMatch && method === 'POST') return handleResetFingerprint(Number(resetMatch[1]), env);
+
+      const deleteMatch = path.match(/^\/admin\/worker\/(\d+)\/delete$/);
+      if (deleteMatch && method === 'POST') return handleDeleteWorker(Number(deleteMatch[1]), env);
 
       if (path === '/admin/settings/allowed-ips' && method === 'POST')
         return handleUpdateAllowedIPs(request, env);
