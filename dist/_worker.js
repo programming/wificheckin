@@ -877,11 +877,36 @@ async function handleAdminView(request, env) {
 </div>
 
 <script>
-function copyURL(url) {
-  navigator.clipboard.writeText(url).then(
-    () => alert('Copied: ' + url),
-    () => prompt('Copy this URL:', url)
-  );
+async function copyURL(url) {
+  // Modern clipboard API (works on desktop + Chrome Android)
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(url);
+      alert('Copied!');
+      return;
+    } catch(e) {}
+  }
+  // iOS Safari fallback: needs contentEditable + range selection
+  const ta = document.createElement('textarea');
+  ta.value = url;
+  ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;font-size:16px;';
+  ta.contentEditable = 'true';
+  ta.readOnly = false;
+  document.body.appendChild(ta);
+  ta.focus();
+  const range = document.createRange();
+  range.selectNodeContents(ta);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+  ta.setSelectionRange(0, 999999);
+  try {
+    document.execCommand('copy');
+    alert('Copied!');
+  } catch(e) {
+    prompt('Copy this URL:', url);
+  }
+  document.body.removeChild(ta);
 }
 <\/script>`);
 
