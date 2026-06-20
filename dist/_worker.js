@@ -211,15 +211,30 @@ function csvSafe(val) {
 }
 
 function toCSV(rows) {
-  const header = ['Worker Name', 'Time (Singapore)', 'IP Address', 'Status', 'Flag Reason'];
+  const header = [
+    'Worker Name', 'Time (Singapore)', 'IP Address', 'Status', 'Flag Reason',
+    'Browser', 'Browser Version', 'OS', 'OS Version',
+    'Screen Resolution', 'Colour Depth', 'Device Pixel Ratio', 'Touch Support', 'Canvas Hash'
+  ];
   const lines = [header.map(h => `"${csvSafe(h)}"`).join(',')];
   for (const row of rows) {
+    let fp = {};
+    try { fp = JSON.parse(row.fingerprint_json || '{}'); } catch { fp = {}; }
     lines.push([
       `"${csvSafe(row.name)}"`,
       `"${csvSafe(formatSGTime(row.timestamp))}"`,
       `"${csvSafe(row.ip_address)}"`,
       `"${csvSafe(row.flagged ? 'REVIEW' : 'OK')}"`,
-      `"${csvSafe(row.flag_reason || '')}"`
+      `"${csvSafe(row.flag_reason || '')}"`,
+      `"${csvSafe(fp.browserName || '')}"`,
+      `"${csvSafe(fp.browserVersion || '')}"`,
+      `"${csvSafe(fp.osName || '')}"`,
+      `"${csvSafe(fp.osVersion || '')}"`,
+      `"${csvSafe(fp.screenRes || '')}"`,
+      `"${csvSafe(fp.colorDepth || '')}"`,
+      `"${csvSafe(fp.devicePixelRatio || '')}"`,
+      `"${csvSafe(fp.touchSupport ?? '')}"`,
+      `"${csvSafe(fp.canvasHash || '')}"`
     ].join(','));
   }
   return lines.join('\r\n');
@@ -540,9 +555,9 @@ async function handleCheckinPost(request, env) {
   }
 
   await env.DB.prepare(
-    `INSERT INTO checkins (worker_id, ip_address, fingerprint_hash, flagged, flag_reason)
-     VALUES (?, ?, ?, ?, ?)`
-  ).bind(worker.id, clientIP, fpHash, flagged, flagReason).run();
+    `INSERT INTO checkins (worker_id, ip_address, fingerprint_hash, fingerprint_json, flagged, flag_reason)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).bind(worker.id, clientIP, fpHash, JSON.stringify(fingerprint), flagged, flagReason).run();
 
   const sgNow = nowSG();
   const timeStr = sgNow.toLocaleString('en-SG', {
@@ -789,7 +804,7 @@ async function handleAdminExport(selectedDate, env) {
   const { start, end } = sgDayToUTCRange(selectedDate);
   const checkins = await env.DB.prepare(`
     SELECT w.first_name || ' ' || w.last_name AS name,
-           c.timestamp, c.ip_address, c.flagged, c.flag_reason
+           c.timestamp, c.ip_address, c.flagged, c.flag_reason, c.fingerprint_json
     FROM checkins c
     JOIN workers w ON w.id = c.worker_id
     WHERE c.timestamp >= ? AND c.timestamp <= ?
