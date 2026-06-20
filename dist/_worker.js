@@ -271,7 +271,7 @@ h2 { font-size: 1.2rem; margin-bottom: 1rem; color: #3f3f46; }
        border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
 .ok  { background: #f0fdf4; border: 1px solid #86efac; color: #166534;
        border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
-input[type=text], input[type=password], input[type=date] {
+input[type=text], input[type=password], input[type=date], input[type=time] {
   width: 100%; padding: .55rem .75rem; border: 1px solid #d4d4d8;
   border-radius: 6px; font-size: 1rem; margin-bottom: .75rem; }
 label { display: block; font-size: .9rem; font-weight: 600;
@@ -367,6 +367,24 @@ async function getAllowedIPs(env) {
 function invalidateAllowedIPsCache() {
   allowedIPsCache = null;
   allowedIPsCachedAt = 0;
+}
+
+async function getStartTime(env) {
+  try {
+    const row = await env.DB.prepare(
+      "SELECT value FROM settings WHERE key = 'START_TIME'"
+    ).first();
+    if (row && row.value) return row.value;
+  } catch { /* fall through */ }
+  return '09:30';
+}
+
+// Convert a SG date string + "HH:MM" start time to a UTC datetime string for DB comparison.
+function startTimeCutoffUTC(sgDateStr, startTime) {
+  const [y, mo, d] = sgDateStr.split('-').map(Number);
+  const [h, mi] = startTime.split(':').map(Number);
+  const cutoff = new Date(Date.UTC(y, mo - 1, d) - SG_OFFSET_MS + h * 3_600_000 + mi * 60_000);
+  return cutoff.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
 }
 
 // ─── Route handlers ───────────────────────────────────────────────────────────
@@ -721,6 +739,7 @@ async function handleAdminView(request, env) {
 
   const { start, end } = sgDayToUTCRange(selectedDate);
   const currentAllowedIPs = await getAllowedIPs(env);
+  const currentStartTime = await getStartTime(env);
 
   const checkins = await env.DB.prepare(`
     SELECT c.id, w.first_name || ' ' || w.last_name AS name,
@@ -786,7 +805,10 @@ async function handleAdminView(request, env) {
 <div class="admin-header">
   <h1>Attendance Admin</h1>
   <span class="myip">Your IP: <strong>${escHtml(clientIP)}</strong></span>
-  <a href="/admin/logout" class="btn btn-sm btn-gray">Log Out</a>
+  <div style="display:flex;gap:.5rem;">
+    <a href="/admin/late?date=${escHtml(selectedDate)}" class="btn btn-sm btn-orange">Late Arrivals</a>
+    <a href="/admin/logout" class="btn btn-sm btn-gray">Log Out</a>
+  </div>
 </div>
 
 <div class="section">
@@ -811,16 +833,25 @@ async function handleAdminView(request, env) {
 </div>
 
 <div class="section">
-  <h2>Allowed IPs</h2>
-  <p style="font-size:.85rem;color:#52525b;margin-bottom:.75rem;">
-    Comma-separated list of exact IPs or CIDR ranges that workers may check in from.
-    Your current IP is <strong>${escHtml(clientIP)}</strong>.
-    To find the shop WiFi IP, open <a href="/myip" target="_blank">/myip</a> on the shop network.
+  <h2>Settings</h2>
+  <label style="margin-bottom:.25rem;">Allowed IPs</label>
+  <p style="font-size:.85rem;color:#52525b;margin-bottom:.5rem;">
+    Comma-separated exact IPs or CIDR ranges. Your current IP is <strong>${escHtml(clientIP)}</strong>.
+    Open <a href="/myip" target="_blank">/myip</a> on the shop WiFi to find its IP.
   </p>
-  <form method="POST" action="/admin/settings/allowed-ips" style="display:flex;gap:.75rem;align-items:flex-start;flex-wrap:wrap;">
+  <form method="POST" action="/admin/settings/allowed-ips" style="display:flex;gap:.75rem;align-items:flex-start;flex-wrap:wrap;margin-bottom:1.2rem;">
     <input type="text" name="allowed_ips" value="${escHtml(currentAllowedIPs)}"
       placeholder="e.g. 203.1.2.3,10.0.0.0/24"
       style="flex:1;min-width:260px;margin:0;font-family:monospace;">
+    <button type="submit" class="btn btn-sm btn-blue" style="white-space:nowrap;">Save</button>
+  </form>
+  <label style="margin-bottom:.25rem;">Shift Start Time (Singapore time)</label>
+  <p style="font-size:.85rem;color:#52525b;margin-bottom:.5rem;">
+    Workers who check in after this time are marked <strong>LATE</strong> on the Late Arrivals page.
+  </p>
+  <form method="POST" action="/admin/settings/start-time" style="display:flex;gap:.75rem;align-items:flex-start;flex-wrap:wrap;">
+    <input type="time" name="start_time" value="${escHtml(currentStartTime)}"
+      style="width:auto;margin:0;">
     <button type="submit" class="btn btn-sm btn-blue" style="white-space:nowrap;">Save</button>
   </form>
 </div>
@@ -918,6 +949,120 @@ async function handleDeleteWorker(workerId, env) {
   return new Response(null, { status: 302, headers: { 'Location': '/admin' } });
 }
 
+async function handleLateView(request, env) {
+  const url = new URL(request.url);
+  const selectedDate = url.searchParams.get('date') || todaySG();
+  const startTime = await getStartTime(env);
+  const { start, end } = sgDayToUTCRange(selectedDate);
+  const cutoff = startTimeCutoffUTC(selectedDate, startTime);
+
+  // All active workers
+  const workersRes = await env.DB.prepare(
+    'SELECT id, first_name, last_name FROM workers WHERE active = 1 ORDER BY first_name, last_name'
+  ).all();
+
+  // First check-in per worker for the day
+  const firstRes = await env.DB.prepare(`
+    SELECT worker_id, MIN(timestamp) AS first_checkin
+    FROM checkins
+    WHERE timestamp >= ? AND timestamp <= ?
+    GROUP BY worker_id
+  `).bind(start, end).all();
+
+  const firstMap = {};
+  for (const r of firstRes.results || []) firstMap[r.worker_id] = r.first_checkin;
+
+  // Classify each worker
+  const rows = (workersRes.results || []).map(w => {
+    const fc = firstMap[w.id] || null;
+    let status, badgeClass;
+    if (!fc) {
+      status = 'ABSENT'; badgeClass = 'badge-absent';
+    } else if (fc > cutoff) {
+      status = 'LATE'; badgeClass = 'badge-late';
+    } else {
+      status = 'ON TIME'; badgeClass = 'badge-ok';
+    }
+    return { w, fc, status, badgeClass };
+  });
+
+  // Sort: ABSENT first, then LATE, then ON TIME
+  const order = { ABSENT: 0, LATE: 1, 'ON TIME': 2 };
+  rows.sort((a, b) => order[a.status] - order[b.status]);
+
+  const tableRows = rows.map(({ w, fc, status, badgeClass }) => `
+    <tr class="${status === 'ON TIME' ? '' : 'flagged'}">
+      <td>${escHtml(w.first_name)} ${escHtml(w.last_name)}</td>
+      <td>${fc ? escHtml(formatSGTime(fc)) : '—'}</td>
+      <td><span class="${badgeClass}">${status}</span></td>
+    </tr>`).join('');
+
+  const absentCount = rows.filter(r => r.status === 'ABSENT').length;
+  const lateCount   = rows.filter(r => r.status === 'LATE').length;
+  const ontimeCount = rows.filter(r => r.status === 'ON TIME').length;
+
+  const css = ADMIN_CSS + `
+    .badge-late   { background:#fee2e2; color:#991b1b; padding:.15rem .5rem;
+                    border-radius:999px; font-size:.78rem; font-weight:700;
+                    border:1px solid #fca5a5; }
+    .badge-absent { background:#f1f5f9; color:#475569; padding:.15rem .5rem;
+                    border-radius:999px; font-size:.78rem; font-weight:700;
+                    border:1px solid #cbd5e1; }
+    .summary-pills { display:flex; gap:.75rem; flex-wrap:wrap; margin-bottom:1.2rem; }
+    .pill { padding:.4rem 1rem; border-radius:999px; font-weight:700; font-size:.9rem; }
+    .pill-absent { background:#f1f5f9; color:#475569; }
+    .pill-late   { background:#fee2e2; color:#991b1b; }
+    .pill-ok     { background:#dcfce7; color:#166534; }
+  `;
+
+  const html = page(`Late Arrivals — ${selectedDate}`, css, `
+<div class="admin-header">
+  <h1>Late Arrivals</h1>
+  <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;">
+    <a href="/admin" class="btn btn-sm btn-gray">← Attendance</a>
+    <a href="/admin/logout" class="btn btn-sm btn-gray">Log Out</a>
+  </div>
+</div>
+
+<div class="section">
+  <div style="display:flex;gap:1rem;align-items:center;flex-wrap:wrap;margin-bottom:1rem;">
+    <form method="GET" action="/admin/late" style="display:flex;gap:.5rem;align-items:center;">
+      <input type="date" name="date" value="${escHtml(selectedDate)}" onchange="this.form.submit()" style="margin:0;">
+    </form>
+    <span style="font-size:.9rem;color:#52525b;">
+      Start time: <strong>${escHtml(startTime)}</strong> SGT
+      — <a href="/admin" style="font-size:.85rem;">change in Settings</a>
+    </span>
+  </div>
+  <div class="summary-pills">
+    <span class="pill pill-absent">${absentCount} Absent</span>
+    <span class="pill pill-late">${lateCount} Late</span>
+    <span class="pill pill-ok">${ontimeCount} On Time</span>
+  </div>
+  <table>
+    <thead><tr><th>Worker</th><th>First Check-in (SGT)</th><th>Status</th></tr></thead>
+    <tbody>${tableRows || '<tr><td colspan="3" style="color:#52525b;">No active workers.</td></tr>'}</tbody>
+  </table>
+</div>`);
+
+  return new Response(html, { headers: { 'Content-Type': 'text/html' } });
+}
+
+async function handleUpdateStartTime(request, env) {
+  const formData = await request.formData();
+  const value = (formData.get('start_time') || '09:30').trim();
+  // Validate HH:MM format
+  if (!/^\d{2}:\d{2}$/.test(value)) {
+    return new Response(null, { status: 302, headers: { 'Location': '/admin' } });
+  }
+  await env.DB.prepare(`
+    INSERT INTO settings (key, value, updated_at)
+    VALUES ('START_TIME', ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = CURRENT_TIMESTAMP
+  `).bind(value, value).run();
+  return new Response(null, { status: 302, headers: { 'Location': '/admin' } });
+}
+
 async function handleUpdateAllowedIPs(request, env) {
   const formData = await request.formData();
   const value = (formData.get('allowed_ips') || '').trim();
@@ -994,6 +1139,12 @@ export default {
 
       if (path === '/admin/settings/allowed-ips' && method === 'POST')
         return handleUpdateAllowedIPs(request, env);
+
+      if (path === '/admin/settings/start-time' && method === 'POST')
+        return handleUpdateStartTime(request, env);
+
+      if (path === '/admin/late' && method === 'GET')
+        return handleLateView(request, env);
 
       return new Response(null, { status: 302, headers: { 'Location': '/admin' } });
     }
