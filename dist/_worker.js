@@ -878,35 +878,40 @@ async function handleAdminView(request, env) {
 
 <script>
 async function copyURL(url) {
-  // Modern clipboard API (works on desktop + Chrome Android)
+  // Best on iOS: native share sheet (includes Copy + WhatsApp etc.)
+  if (navigator.share) {
+    try { await navigator.share({ url }); return; } catch(e) {
+      if (e.name === 'AbortError') return; // user dismissed — not an error
+    }
+  }
+  // Desktop / Android Chrome: clipboard API
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    try {
-      await navigator.clipboard.writeText(url);
-      alert('Copied!');
-      return;
-    } catch(e) {}
+    try { await navigator.clipboard.writeText(url); alert('Copied!'); return; } catch(e) {}
   }
-  // iOS Safari fallback: needs contentEditable + range selection
-  const ta = document.createElement('textarea');
-  ta.value = url;
-  ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;font-size:16px;';
-  ta.contentEditable = 'true';
-  ta.readOnly = false;
-  document.body.appendChild(ta);
-  ta.focus();
-  const range = document.createRange();
-  range.selectNodeContents(ta);
-  const sel = window.getSelection();
-  sel.removeAllRanges();
-  sel.addRange(range);
-  ta.setSelectionRange(0, 999999);
-  try {
-    document.execCommand('copy');
-    alert('Copied!');
-  } catch(e) {
-    prompt('Copy this URL:', url);
-  }
-  document.body.removeChild(ta);
+  // Last resort: show a modal the user can long-press to copy from
+  showCopyModal(url);
+}
+
+function showCopyModal(url) {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:999;display:flex;align-items:center;justify-content:center;padding:1.5rem;';
+  overlay.innerHTML = \`
+    <div style="background:#fff;border-radius:12px;padding:1.5rem;width:100%;max-width:440px;box-shadow:0 8px 32px rgba(0,0,0,.2);">
+      <p style="font-weight:700;margin-bottom:.75rem;">Long-press the URL to copy</p>
+      <input id="_copyInput" type="text" readonly value="\${url.replace(/"/g,'&quot;')}"
+        style="width:100%;padding:.6rem .75rem;border:1px solid #d4d4d8;border-radius:6px;
+               font-size:15px;font-family:monospace;margin-bottom:1rem;">
+      <button onclick="this.closest('div').parentElement.remove()"
+        style="width:100%;padding:.7rem;background:#e4e4e7;border:none;border-radius:8px;
+               font-size:1rem;font-weight:600;cursor:pointer;">Close</button>
+    </div>\`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  // Select the text so it's ready to copy
+  setTimeout(() => {
+    const inp = document.getElementById('_copyInput');
+    if (inp) { inp.focus(); inp.select(); inp.setSelectionRange(0, 999999); }
+  }, 100);
 }
 <\/script>`);
 
