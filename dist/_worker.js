@@ -339,6 +339,18 @@ function compareFingerprints(baseline, current) {
   return changed;
 }
 
+// ─── Settings (ALLOWED_IPS stored in DB, env var is fallback) ────────────────
+
+async function getAllowedIPs(env) {
+  try {
+    const row = await env.DB.prepare(
+      "SELECT value FROM settings WHERE key = 'ALLOWED_IPS'"
+    ).first();
+    if (row && row.value) return row.value;
+  } catch { /* fall through */ }
+  return env.ALLOWED_IPS || '';
+}
+
 // ─── Route handlers ───────────────────────────────────────────────────────────
 
 async function handleMyIP(request) {
@@ -367,7 +379,7 @@ async function handleCheckinGet(request, env) {
   }
 
   const clientIP = request.headers.get('CF-Connecting-IP') || '';
-  const allowed = isIPAllowed(clientIP, env.ALLOWED_IPS || '');
+  const allowed = isIPAllowed(clientIP, await getAllowedIPs(env));
   if (!allowed) {
     return new Response(errorPage(
       'Wrong Network',
@@ -522,7 +534,7 @@ async function handleCheckinPost(request, env) {
   }
 
   const clientIP = request.headers.get('CF-Connecting-IP') || '';
-  if (!isIPAllowed(clientIP, env.ALLOWED_IPS || '')) {
+  if (!isIPAllowed(clientIP, await getAllowedIPs(env))) {
     return new Response(errorPage('Wrong Network',
       'You must be connected to the shop WiFi to check in. Please do not use mobile data.'),
       { status: 403, headers: { 'Content-Type': 'text/html' } });
@@ -684,6 +696,7 @@ async function handleAdminView(request, env) {
   }
 
   const { start, end } = sgDayToUTCRange(selectedDate);
+  const currentAllowedIPs = await getAllowedIPs(env);
 
   const checkins = await env.DB.prepare(`
     SELECT c.id, w.first_name || ' ' || w.last_name AS name,
@@ -766,6 +779,21 @@ async function handleAdminView(request, env) {
         <tbody>${rows}</tbody>
        </table>${flagNote}`
     : '<p style="color:#52525b;">No check-ins recorded for this day.</p>'}
+</div>
+
+<div class="section">
+  <h2>Allowed IPs</h2>
+  <p style="font-size:.85rem;color:#52525b;margin-bottom:.75rem;">
+    Comma-separated list of exact IPs or CIDR ranges that workers may check in from.
+    Your current IP is <strong>${escHtml(clientIP)}</strong>.
+    To find the shop WiFi IP, open <a href="/myip" target="_blank">/myip</a> on the shop network.
+  </p>
+  <form method="POST" action="/admin/settings/allowed-ips" style="display:flex;gap:.75rem;align-items:flex-start;flex-wrap:wrap;">
+    <input type="text" name="allowed_ips" value="${escHtml(currentAllowedIPs)}"
+      placeholder="e.g. 203.1.2.3,10.0.0.0/24"
+      style="flex:1;min-width:260px;margin:0;font-family:monospace;">
+    <button type="submit" class="btn btn-sm btn-blue" style="white-space:nowrap;">Save</button>
+  </form>
 </div>
 
 <div class="section">
@@ -853,6 +881,17 @@ async function handleResetFingerprint(workerId, env) {
   return new Response(null, { status: 302, headers: { 'Location': '/admin' } });
 }
 
+async function handleUpdateAllowedIPs(request, env) {
+  const formData = await request.formData();
+  const value = (formData.get('allowed_ips') || '').trim();
+  await env.DB.prepare(`
+    INSERT INTO settings (key, value, updated_at)
+    VALUES ('ALLOWED_IPS', ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = CURRENT_TIMESTAMP
+  `).bind(value, value).run();
+  return new Response(null, { status: 302, headers: { 'Location': '/admin' } });
+}
+
 async function handleAdminLogout() {
   return new Response(null, {
     status: 302,
@@ -911,6 +950,9 @@ export default {
 
       const resetMatch = path.match(/^\/admin\/worker\/(\d+)\/reset-fp$/);
       if (resetMatch && method === 'POST') return handleResetFingerprint(Number(resetMatch[1]), env);
+
+      if (path === '/admin/settings/allowed-ips' && method === 'POST')
+        return handleUpdateAllowedIPs(request, env);
 
       return new Response(null, { status: 302, headers: { 'Location': '/admin' } });
     }
