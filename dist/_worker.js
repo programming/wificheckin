@@ -1019,6 +1019,7 @@ async function handleLateView(request, env) {
 <div class="admin-header">
   <h1>Late Arrivals</h1>
   <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;">
+    <a href="/admin/late/month" class="btn btn-sm btn-orange">Monthly Report</a>
     <a href="/admin" class="btn btn-sm btn-gray">← Attendance</a>
     <a href="/admin/logout" class="btn btn-sm btn-gray">Log Out</a>
   </div>
@@ -1043,6 +1044,143 @@ async function handleLateView(request, env) {
     <thead><tr><th>Worker</th><th>First Check-in (SGT)</th><th>Status</th></tr></thead>
     <tbody>${tableRows || '<tr><td colspan="3" style="color:#52525b;">No active workers.</td></tr>'}</tbody>
   </table>
+</div>`);
+
+  return new Response(html, { headers: { 'Content-Type': 'text/html' } });
+}
+
+async function handleLateMonthView(request, env) {
+  const url = new URL(request.url);
+  const sgNow = nowSG();
+  const defaultMonth = `${sgNow.getUTCFullYear()}-${String(sgNow.getUTCMonth() + 1).padStart(2, '0')}`;
+  const selectedMonth = url.searchParams.get('month') || defaultMonth;
+
+  const [y, mo] = selectedMonth.split('-').map(Number);
+  const startTime = await getStartTime(env);
+
+  // UTC bounds for the entire SG month
+  const fmt = dt => dt.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+  const monthStartUTC = new Date(Date.UTC(y, mo - 1, 1) - SG_OFFSET_MS);
+  const monthEndUTC   = new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999) - SG_OFFSET_MS);
+
+  const checkinsRes = await env.DB.prepare(`
+    SELECT c.worker_id, w.first_name || ' ' || w.last_name AS name, c.timestamp
+    FROM checkins c
+    JOIN workers w ON w.id = c.worker_id
+    WHERE c.timestamp >= ? AND c.timestamp <= ?
+    ORDER BY c.worker_id, c.timestamp ASC
+  `).bind(fmt(monthStartUTC), fmt(monthEndUTC)).all();
+
+  // Group by (worker_id, sg_date) keeping only the first check-in per worker per day.
+  // Rows are already ordered by worker_id, timestamp ASC so the first row seen per key is correct.
+  const groups = {};
+  for (const row of checkinsRes.results || []) {
+    const sgD = toSGDate(new Date(row.timestamp + 'Z'));
+    const sgDateStr = `${sgD.getUTCFullYear()}-${String(sgD.getUTCMonth() + 1).padStart(2, '0')}-${String(sgD.getUTCDate()).padStart(2, '0')}`;
+    const key = `${row.worker_id}:${sgDateStr}`;
+    if (!groups[key]) groups[key] = { worker_id: row.worker_id, name: row.name, sgDate: sgDateStr, firstCheckin: row.timestamp };
+  }
+
+  // Identify late entries and compute minutes late
+  const lateEntries = [];
+  for (const entry of Object.values(groups)) {
+    const cutoff = startTimeCutoffUTC(entry.sgDate, startTime);
+    if (entry.firstCheckin > cutoff) {
+      const minsLate = Math.round(
+        (new Date(entry.firstCheckin + 'Z') - new Date(cutoff + 'Z')) / 60_000
+      );
+      lateEntries.push({ ...entry, minsLate });
+    }
+  }
+
+  // Sort detail rows by date then name
+  lateEntries.sort((a, b) => a.sgDate.localeCompare(b.sgDate) || a.name.localeCompare(b.name));
+
+  // Per-worker summary
+  const summaryMap = {};
+  for (const e of lateEntries) {
+    if (!summaryMap[e.worker_id]) summaryMap[e.worker_id] = { name: e.name, count: 0, totalMins: 0 };
+    summaryMap[e.worker_id].count++;
+    summaryMap[e.worker_id].totalMins += e.minsLate;
+  }
+  const summary = Object.values(summaryMap).sort((a, b) => b.totalMins - a.totalMins);
+
+  // Friendly day label e.g. "Mon 15 Jul"
+  function dayLabel(sgDateStr) {
+    const d = new Date(sgDateStr + 'T00:00:00Z');
+    return d.toLocaleDateString('en-SG', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' });
+  }
+
+  const summaryRows = summary.map(s => `
+    <tr>
+      <td>${escHtml(s.name)}</td>
+      <td style="text-align:center;">${s.count}</td>
+      <td style="text-align:center;">${s.totalMins}</td>
+      <td style="text-align:center;">${Math.round(s.totalMins / s.count)}</td>
+    </tr>`).join('');
+
+  const detailRows = lateEntries.map(e => `
+    <tr>
+      <td>${escHtml(dayLabel(e.sgDate))}</td>
+      <td>${escHtml(e.name)}</td>
+      <td>${escHtml(formatSGTime(e.firstCheckin))}</td>
+      <td style="text-align:center;font-weight:600;color:#991b1b;">+${e.minsLate} min</td>
+    </tr>`).join('');
+
+  const css = ADMIN_CSS + `
+    .badge-late { background:#fee2e2; color:#991b1b; padding:.15rem .5rem;
+                  border-radius:999px; font-size:.78rem; font-weight:700; border:1px solid #fca5a5; }
+    td[style*="text-align:center"] { text-align:center; }
+  `;
+
+  // Build month options: current month going back 12 months
+  const monthOptions = Array.from({ length: 12 }, (_, i) => {
+    const d = new Date(Date.UTC(sgNow.getUTCFullYear(), sgNow.getUTCMonth() - i, 1));
+    const val = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+    const label = d.toLocaleDateString('en-SG', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+    return `<option value="${val}" ${val === selectedMonth ? 'selected' : ''}>${escHtml(label)}</option>`;
+  }).join('');
+
+  const html = page(`Late — ${selectedMonth}`, css, `
+<div class="admin-header">
+  <h1>Monthly Late Report</h1>
+  <div style="display:flex;gap:.5rem;">
+    <a href="/admin/late" class="btn btn-sm btn-gray">← Daily View</a>
+    <a href="/admin" class="btn btn-sm btn-gray">Attendance</a>
+    <a href="/admin/logout" class="btn btn-sm btn-gray">Log Out</a>
+  </div>
+</div>
+
+<div class="section">
+  <div style="display:flex;gap:1rem;align-items:center;flex-wrap:wrap;margin-bottom:1.2rem;">
+    <form method="GET" action="/admin/late/month">
+      <select name="month" onchange="this.form.submit()"
+        style="padding:.5rem .75rem;border:1px solid #d4d4d8;border-radius:6px;font-size:1rem;">
+        ${monthOptions}
+      </select>
+    </form>
+    <span style="font-size:.9rem;color:#52525b;">Start time: <strong>${escHtml(startTime)}</strong> SGT</span>
+  </div>
+
+  ${summary.length === 0
+    ? '<p style="color:#52525b;">No late check-ins recorded for this month.</p>'
+    : `<h2 style="margin-bottom:.75rem;">Summary</h2>
+       <table style="margin-bottom:2rem;">
+         <thead><tr>
+           <th>Worker</th>
+           <th style="text-align:center;">Days Late</th>
+           <th style="text-align:center;">Total Min Late</th>
+           <th style="text-align:center;">Avg Min Late</th>
+         </tr></thead>
+         <tbody>${summaryRows}</tbody>
+       </table>
+       <h2 style="margin-bottom:.75rem;">Detail</h2>
+       <table>
+         <thead><tr>
+           <th>Date</th><th>Worker</th><th>First Check-in (SGT)</th><th style="text-align:center;">Min Late</th>
+         </tr></thead>
+         <tbody>${detailRows}</tbody>
+       </table>`}
 </div>`);
 
   return new Response(html, { headers: { 'Content-Type': 'text/html' } });
@@ -1145,6 +1283,9 @@ export default {
 
       if (path === '/admin/late' && method === 'GET')
         return handleLateView(request, env);
+
+      if (path === '/admin/late/month' && method === 'GET')
+        return handleLateMonthView(request, env);
 
       return new Response(null, { status: 302, headers: { 'Location': '/admin' } });
     }
