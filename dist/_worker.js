@@ -267,6 +267,9 @@ h2 { font-size: 1.2rem; margin-bottom: 1rem; color: #3f3f46; }
 .btn-gray { background: #e4e4e7; color: #18181b; }
 .btn-gray:hover { background: #d4d4d8; }
 .btn-orange { background: #ea580c; color: #fff; }
+.warning { font-size: .85rem; color: #7c2d12; background: #fff7ed;
+           border: 1px solid #fed7aa; border-radius: 8px;
+           padding: .75rem 1rem; margin-bottom: 1.5rem; line-height: 1.5; }
 .err { background: #fef2f2; border: 1px solid #fca5a5; color: #991b1b;
        border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
 .ok  { background: #f0fdf4; border: 1px solid #86efac; color: #166534;
@@ -435,6 +438,12 @@ async function handleCheckinGet(request, env) {
   <div class="time">${timeStr}</div>
   <p class="notice">When you check in, we record your device and network details to confirm
   you are on site. This is used only for attendance.</p>
+  <div class="warning">
+    This link is registered to <strong>${escHtml(worker.first_name)} ${escHtml(worker.last_name)}</strong> only.
+    By tapping CHECK IN, you confirm that you are this person and are physically present on site.
+    Checking in on behalf of someone else, or allowing others to use your link, is considered fraud
+    and may result in disciplinary action or termination.
+  </div>
   <button class="btn btn-green" id="checkinBtn" onclick="submitCheckin('${escHtml(token)}')">
     CHECK IN
   </button>
