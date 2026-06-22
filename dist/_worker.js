@@ -887,15 +887,22 @@ async function handleAdminView(request, env) {
 
 <script>
 async function copyURL(url) {
-  // Best on iOS: native share sheet (includes Copy + WhatsApp etc.)
-  if (navigator.share) {
+  const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent);
+  // On iOS the share sheet is more reliable than the clipboard API
+  if (isIOS && navigator.share) {
     try { await navigator.share({ url }); return; } catch(e) {
       if (e.name === 'AbortError') return; // user dismissed — not an error
     }
   }
-  // Desktop / Android Chrome: clipboard API
+  // Desktop and Android: clipboard API first (direct copy with confirmation)
   if (navigator.clipboard && navigator.clipboard.writeText) {
     try { await navigator.clipboard.writeText(url); alert('Copied!'); return; } catch(e) {}
+  }
+  // Non-iOS mobile fallback: share sheet
+  if (!isIOS && navigator.share) {
+    try { await navigator.share({ url }); return; } catch(e) {
+      if (e.name === 'AbortError') return;
+    }
   }
   // Last resort: show a modal the user can long-press to copy from
   showCopyModal(url);
